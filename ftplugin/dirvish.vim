@@ -31,5 +31,9 @@ execute 'nnoremap '.s:nowait.'<buffer> x :Shdo  {}<Left><Left><Left>'
 execute 'xnoremap '.s:nowait.'<buffer> x :Shdo  {}<Left><Left><Left>'
 
 " Buffer-local / and ? mappings to skip the concealed path fragment.
-nnoremap <buffer> / /\ze[^\/]*[\/]\=$<Home>
-nnoremap <buffer> ? ?\ze[^\/]*[\/]\=$<Home>
+"
+let s:vim_dirvish_enable_mapping = get(g:, 'vim_dirvish_enable_mapping', 0)
+if s:vim_dirvish_enable_mapping
+  nnoremap <buffer> / /\ze[^\/]*[\/]\=$<Home>
+  nnoremap <buffer> ? ?\ze[^\/]*[\/]\=$<Home>
+endif
