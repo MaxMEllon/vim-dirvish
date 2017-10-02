@@ -1,9 +1,15 @@
+let s:srcdir = expand('<sfile>:h:h:p')
 let s:sep = exists('+shellslash') && !&shellslash ? '\' : '/'
 let s:noswapfile = (2 == exists(':noswapfile')) ? 'noswapfile' : ''
 let s:noau       = 'silent noautocmd keepjumps'
 
 function! s:msg_error(msg) abort
   redraw | echohl ErrorMsg | echomsg 'dirvish:' a:msg | echohl None
+endfunction
+
+function! s:suf() abort
+  let m = get(g:, 'dirvish_mode', 1)
+  return type(m) == type(0) && m <= 1 ? 1 : 0
 endfunction
 
 " Normalize slashes for safe use of fnameescape(), isdirectory(). Vim bug #541.
@@ -34,11 +40,11 @@ endfunction
 
 if v:version > 703
 function! s:globlist(pat) abort
-  return glob(a:pat, 1, 1)
+  return glob(a:pat, !s:suf(), 1)
 endfunction
 else "Vim 7.3 glob() cannot handle filenames containing newlines.
 function! s:globlist(pat) abort
-  return split(glob(a:pat, 1), "\n")
+  return split(glob(a:pat, !s:suf()), "\n")
 endfunction
 endif
 
@@ -51,21 +57,38 @@ function! s:list_dir(dir) abort
 
   if get(g:, 'dirvish_relative_paths', 0)
       \ && a:dir != s:parent_dir(getcwd()) "avoid blank CWD
-    return sort(map(paths, "fnamemodify(v:val, ':p:.')"))
+    return map(paths, "fnamemodify(v:val, ':p:.')")
   else
-    return sort(map(paths, "fnamemodify(v:val, ':p')"))
+    return map(paths, "fnamemodify(v:val, ':p')")
   endif
 endfunction
 
-function! dirvish#shdo(l1, l2, cmd)
-  let lines = filter(getline(a:l1, a:l2), '-1!=match(v:val,"\\S")') "find non-empty
-  if empty(lines) | call s:msg_error('empty path') | return | endif
+function! s:set_args(args) abort
+  if arglistid() == 0
+    arglocal
+  endif
+  for f in a:args
+    if -1 == index(argv(), f)
+      exe '$argadd '.fnameescape(fnamemodify(f, ':p'))
+    endif
+  endfor
+  echo 'arglist: '.argc().' files'
+  " Force recalculation of DirvishArg syntax group.
+  unlet b:current_syntax
+  exe 'source '.fnameescape(s:srcdir.'/syntax/dirvish.vim')
+endfunction
+
+function! dirvish#shdo(paths, cmd)
+  " Remove empty/duplicate lines.
+  let lines = uniq(sort(filter(copy(a:paths), '-1!=match(v:val,"\\S")')))
+  let head = fnamemodify(get(lines, 0, '')[:-2], ':h')
+  let jagged = 0 != len(filter(copy(lines), 'head != fnamemodify(v:val[:-2], ":h")'))
+  if empty(lines) | call s:msg_error('Shdo: no files') | return | endif
 
   let dirvish_bufnr = bufnr('%')
   let cmd = a:cmd =~# '\V{}' ? a:cmd : (empty(a:cmd)?'{}':(a:cmd.' {}')) "DWIM
-  "Paths coming from non-dirvish buffers may be jagged; assume CWD instead of narrowing.
-  let should_narrow = exists('b:dirvish')
-  let dir = should_narrow ? b:dirvish._dir : getcwd()
+  " Paths from argv() or non-dirvish buffers may be jagged; assume CWD then.
+  let dir = !jagged && exists('b:dirvish') ? b:dirvish._dir : getcwd()
   let tmpfile = tempname().(&sh=~?'cmd.exe'?'.bat':(&sh=~'powershell'?'.ps1':'.sh'))
 
   for i in range(0, len(lines)-1)
@@ -74,8 +97,8 @@ function! dirvish#shdo(l1, l2, cmd)
       let lines[i] = '#invalid path: '.shellescape(f)
       continue
     endif
-    let f = should_narrow && 2==exists(':lcd') ? fnamemodify(f, ':t') : lines[i]
-    let lines[i] = substitute(cmd, '\V{}', escape(shellescape(f),'\'), 'g')
+    let f = !jagged && 2==exists(':lcd') ? fnamemodify(f, ':t') : lines[i]
+    let lines[i] = substitute(cmd, '\V{}', escape(shellescape(f),'&\'), 'g')
   endfor
   execute 'silent split' tmpfile '|' (2==exists(':lcd')?('lcd '.dir):'')
   setlocal bufhidden=wipe
@@ -88,16 +111,13 @@ function! dirvish#shdo(l1, l2, cmd)
 
   augroup dirvish_shcmd
     autocmd! * <buffer>
-    " Refresh after executing the command.
-    exe 'autocmd ShellCmdPost <buffer> nested if bufexists('.dirvish_bufnr.')|buffer '.dirvish_bufnr
-          \ .'|silent! Dirvish %|endif|buffer '.bufnr('%').'|setlocal bufhidden=wipe'
+    " Refresh Dirvish after executing a shell command.
+    exe 'autocmd ShellCmdPost <buffer> nested if !v:shell_error && bufexists('.dirvish_bufnr.')'
+      \.'|setlocal bufhidden=hide|buffer '.dirvish_bufnr.'|silent! Dirvish %'
+      \.'|buffer '.bufnr('%').'|setlocal bufhidden=wipe|endif'
   augroup END
 
-  if exists(':terminal')
-    nnoremap <buffer><silent> Z! :silent write<Bar>te %<CR>
-  else
-    nnoremap <buffer><silent> Z! :silent write<Bar>!%<CR>
-  endif
+  nnoremap <buffer><silent> Z! :silent write<Bar>exe '!'.(has('win32')?'':shellescape(&shell)).' %'<Bar>if !v:shell_error<Bar>close<Bar>endif<CR>
 endfunction
 
 function! s:buf_init() abort
@@ -125,7 +145,7 @@ function! s:on_bufenter() abort
     return
   endif
   if 0 == &l:cole
-    call <sid>win_init()
+    call s:win_init()
   endif
 endfunction
 
@@ -226,17 +246,25 @@ function! s:open_selected(split_cmd, bg, line1, line2) abort
   endif
 endfunction
 
+function! s:is_valid_altbuf(bnr) abort
+  return a:bnr != bufnr('%') && bufexists(a:bnr) && empty(getbufvar(a:bnr, 'dirvish'))
+endfunction
+
 function! s:set_altbuf(bnr) abort
+  if !s:is_valid_altbuf(a:bnr) | return | endif
+
+  if has('patch-7.4.605') | let @# = a:bnr | return | endif
+
   let curbuf = bufnr('%')
-  call s:try_visit(a:bnr)
-  let noau = bufloaded(curbuf) ? 'noau' : ''
-  " Return to the current buffer.
-  execute 'silent keepjumps' noau s:noswapfile 'buffer' curbuf
+  if s:try_visit(a:bnr)
+    let noau = bufloaded(curbuf) ? 'noau' : ''
+    " Return to the current buffer.
+    execute 'silent keepjumps' noau s:noswapfile 'buffer' curbuf
+  endif
 endfunction
 
 function! s:try_visit(bnr) abort
-  if a:bnr != bufnr('%') && bufexists(a:bnr)
-        \ && empty(getbufvar(a:bnr, 'dirvish'))
+  if s:is_valid_altbuf(a:bnr)
     " If _previous_ buffer is _not_ loaded (because of 'nohidden'), we must
     " allow autocmds (else no syntax highlighting; #13).
     let noau = bufloaded(a:bnr) ? 'noau' : ''
@@ -291,6 +319,9 @@ function! s:buf_render(dir, lastpath) abort
   endif
   silent keepmarks keepjumps %delete _
   silent keepmarks keepjumps call setline(1, s:list_dir(a:dir))
+  if type("") == type(get(g:, 'dirvish_mode'))  " Apply user's filter.
+    execute get(g:, 'dirvish_mode')
+  endif
   if v:version > 704 || v:version == 704 && has("patch73")
     setlocal undolevels<
   endif
@@ -300,8 +331,12 @@ function! s:buf_render(dir, lastpath) abort
   endif
 
   if !empty(a:lastpath)
-    keepjumps call search('\V\^'.escape(a:lastpath, '\').'\$', 'cw')
+    let pat = get(g:, 'dirvish_relative_paths', 0) ? fnamemodify(a:lastpath, ':p:.') : a:lastpath
+    let pat = empty(pat) ? a:lastpath : pat  " no longer in CWD
+    call search('\V\^'.escape(pat, '\').'\$', 'cw')
   endif
+  " Place cursor on the tail (last path segment).
+  call search('\'.s:sep.'\zs[^\'.s:sep.']\+\'.s:sep.'\?$', 'c', line('.'))
 endfunction
 
 function! s:do_open(d, reload) abort
@@ -310,7 +345,7 @@ function! s:do_open(d, reload) abort
 
   let dirname_without_sep = substitute(d._dir, '[\\/]\+$', '', 'g')
   let bnr_nonnormalized = bufnr('^'.dirname_without_sep.'$')
-   
+
   " Vim tends to name the buffer using its reduced path.
   " Examples (Win32 gvim 7.4.618):
   "     ~\AppData\Local\Temp\
@@ -331,9 +366,9 @@ function! s:do_open(d, reload) abort
   endfor
 
   if -1 == bnr
-    execute 'silent noau keepjumps' s:noswapfile 'edit' fnameescape(d._dir)
+    execute 'silent noau ' s:noswapfile 'edit' fnameescape(d._dir)
   else
-    execute 'silent noau keepjumps' s:noswapfile 'buffer' bnr
+    execute 'silent noau ' s:noswapfile 'buffer' bnr
   endif
 
   "If the directory is relative to CWD, :edit refuses to create a buffer
@@ -352,6 +387,10 @@ function! s:do_open(d, reload) abort
   if s:sl(bufname('%')) !=# d._dir  "We have a bug or Vim has a regression.
     echoerr 'expected buffer name: "'.d._dir.'" (actual: "'.bufname('%').'")'
     return
+  endif
+
+  if -1 == bnr && exists("#BufNew") " Fire BufNew with the normalized file name.
+    exe 'doautocmd <nomodeline> BufNew' bufname('%')
   endif
 
   if &buflisted && bufnr('$') > 1
@@ -423,3 +462,5 @@ function! dirvish#open(...) range abort
 endfunction
 
 nnoremap <silent> <Plug>(dirvish_quit) :<C-U>call <SID>buf_close()<CR>
+nnoremap <silent> <Plug>(dirvish_arg) :<C-U>call <SID>set_args([getline('.')])<CR>
+xnoremap <silent> <Plug>(dirvish_arg) :<C-U>call <SID>set_args(getline("'<", "'>"))<CR>
