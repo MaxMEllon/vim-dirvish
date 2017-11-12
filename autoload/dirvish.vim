@@ -64,17 +64,18 @@ function! s:list_dir(dir) abort
 endfunction
 
 function! s:set_args(args) abort
-  if arglistid() == 0
+  if exists('*arglistid') && arglistid() == 0
     arglocal
   endif
+  let normalized_argv = map(argv(), 'fnamemodify(v:val, ":p")')
   for f in a:args
-    if -1 == index(argv(), f)
+    if -1 == index(normalized_argv, f)
       exe '$argadd '.fnameescape(fnamemodify(f, ':p'))
     endif
   endfor
   echo 'arglist: '.argc().' files'
-  " Force recalculation of DirvishArg syntax group.
-  unlet b:current_syntax
+
+  " Define (again) DirvishArg syntax group.
   exe 'source '.fnameescape(s:srcdir.'/syntax/dirvish.vim')
 endfunction
 
